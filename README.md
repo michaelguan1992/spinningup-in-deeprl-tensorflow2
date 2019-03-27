@@ -6,6 +6,8 @@ Setup:
 Install OpenMPI:
 For Ubuntu:
 >sudo apt-get update && sudo apt-get install libopenmpi-dev
+
+
 For Mac OS X, you need to install Homebrew, and then
 >brew install openmpi
 
