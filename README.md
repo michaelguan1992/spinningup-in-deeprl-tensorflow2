@@ -1,7 +1,7 @@
 # DeepRL-in-Tensorflow2
-Recently, Google releases their next generation end-to-end open source machine learning platform Tensorflow 2.0 (March 2019), and back in September 2018, OpenAI releases a beginner-level tutorial series of reinforcement learing called Spinning Up in Deep RL. I love these two project, and one thought came to my mind: why not re-implement the spinning up deep RL algorithms with Tensorflow 2.0? It may also benefits beginners. What a thought!
+Recently, Google releases their next generation end-to-end open source machine learning platform Tensorflow 2.0 (March 2019), and back in September 2018, OpenAI releases a beginner-level tutorial series of reinforcement learing called Spinning Up in Deep RL. I love these two project, and one thought came to my mind: why not re-implement the spinning up deep RL algorithms with Tensorflow 2.0? It may also benefits beginners. 
+The implementation includes two parts: python script file and jupyter notebook. The jupyter notebook implementation is a simplified version that can be run by itself, but with no MPI support.
 
-I don't provide a setup.py file just because
 Setup:
 Install OpenMPI:
 For Ubuntu:
@@ -12,12 +12,12 @@ For Mac OS X, you need to install Homebrew, and then
 >brew install openmpi
 
 Required python packages:
-(1) Tensorflow 2.0 alpha
-(2) Tensorflow probability nightly
-(3) gym
-(4) mpi4py
-(5) matplotlib
-(6) jupyter notebook/lab
+* Tensorflow 2.0 alpha
+* Tensorflow probability nightly
+* gym
+* mpi4py (not necessary for jupyter notebook version)
+* matplotlib
+* jupyter notebook/lab
 
 Links:
 OpenAI SpinningUp:
