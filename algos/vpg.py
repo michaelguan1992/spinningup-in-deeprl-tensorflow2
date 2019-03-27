@@ -2,6 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import tensorflow as tf
 import tensorflow_probability as tfp
+import gym
 from gym.spaces import Box, Discrete
 import time
 from utils.mpi_tools import mpi_fork, proc_id, mpi_statistics_scalar, num_procs
@@ -44,13 +45,6 @@ def gaussian_likelihood(x, mu, log_std):
   return tf.reduce_sum(pre_sum, axis=1)
 
 
-def sync_actor_critic(actor_critic):
-  if hasattr(actor_critic, 'log_std'):
-    sync_params([actor_critic.log_std])
-  sync_model(actor_critic.pi_mlp)
-  sync_model(actor_critic.v_mlp)
-
-
 def make_mlp_model(input_shape, sizes, activation='tanh', output_activation=None):
   """ Build a feedforward neural network. """
   mlp = tf.keras.Sequential()
@@ -69,7 +63,7 @@ Actor-Critics
 
 
 class ActorCritic:
-  def __init__(self, obs_dim, hidden_sizes=(64, 64), activation='tanh', output_activation=None, action_space=None):
+  def __init__(self, obs_dim, hidden_sizes=(64, 64), activation='tanh', output_activation=None, action_space=None, pi_lr=3e-4, vf_lr=1e-3, train_v_iters=80):
     if isinstance(action_space, Box):
       act_dim = len(action_space.sample())
       self.pi_mlp = make_mlp_model(obs_dim, list(hidden_sizes) + [act_dim], activation, output_activation)
@@ -82,6 +76,10 @@ class ActorCritic:
       self.policy = self._mlp_categorical_policy
       self.action_space = action_space
     self.v_mlp = make_mlp_model(obs_dim, list(hidden_sizes) + [1], activation, None)
+    # optimizers
+    self.pi_optimizer = MpiAdamOptimizer(learning_rate=pi_lr)
+    self.vf_optimizer = MpiAdamOptimizer(learning_rate=vf_lr)
+    self.train_v_iters = train_v_iters
 
   @tf.function
   def __call__(self, observation, action):
@@ -110,6 +108,36 @@ class ActorCritic:
     else:
       logp = gaussian_likelihood(pi, mu, self.log_std)
     return pi, logp
+
+  def update(self, buf):
+    obs_buf, act_buf, adv_buf, ret_buf, logp_buf = buf.get()
+
+    with tf.GradientTape() as pi_tape, tf.GradientTape() as vf_tape:
+      pi, logp, v = self.__call__(obs_buf, act_buf)
+
+      pi_loss = -tf.reduce_mean(logp * adv_buf)
+      v_loss = tf.reduce_mean((ret_buf - v) ** 2)
+
+    if hasattr(self, 'log_std'):
+      all_trainable_variables = [self.log_std, *self.pi_mlp.trainable_variables]
+      pi_grads = pi_tape.gradient(pi_loss, all_trainable_variables)
+      self.pi_optimizer.apply_gradients(zip(pi_grads, all_trainable_variables))
+    else:
+      pi_grads = pi_tape.gradient(pi_loss, self.pi_mlp.trainable_variables)
+      self.pi_optimizer.apply_gradients(zip(pi_grads, self.pi_mlp.trainable_variables))
+
+    vf_grads = vf_tape.gradient(v_loss, self.v_mlp.trainable_variables)
+    for _ in range(self.train_v_iters):
+      self.vf_optimizer.apply_gradients(zip(vf_grads, self.v_mlp.trainable_variables))
+
+    # make sure that params across processes are synchronized
+    self.synchronize()
+
+  def synchronize(self):
+    if hasattr(self, 'log_std'):
+      sync_params([self.log_std])
+    sync_model(self.pi_mlp)
+    sync_model(self.v_mlp)
 
 
 """
@@ -195,54 +223,23 @@ Vanilla Policy Gradient
 """
 
 
-def vpg(env, ac_kwargs=None, seed=0, steps_per_epoch=4000, epochs=50, gamma=0.99, pi_lr=3e-4,
-        vf_lr=1e-3, train_v_iters=80, lam=0.97, max_ep_len=1000, save_freq=10):
+def vpg(env, ac_kwargs=None, seed=0, steps_per_epoch=4000, epochs=50, gamma=0.99, lam=0.97, max_ep_len=1000, save_freq=10):
 
   seed += 10000 * proc_id()
   tf.random.set_seed(seed)
   np.random.seed(seed)
-  # Create actor-critic agent
+  # Create actor-critic agent and synchronize it
   ac_kwargs['action_space'] = env.action_space
   ac_kwargs['obs_dim'] = env.observation_space.shape[0]
 
   actor_critic = ActorCritic(**ac_kwargs)
-
-  # sync params across processes
-  sync_actor_critic(actor_critic)
+  actor_critic.synchronize()
 
   # Experience buffer
   obs_dim = env.observation_space.shape
   act_dim = env.action_space.shape
   local_steps_per_epoch = int(steps_per_epoch / num_procs())
   buf = VPGBuffer(obs_dim, act_dim, local_steps_per_epoch, gamma, lam)
-
-  # optimizers
-  pi_optimizer = MpiAdamOptimizer(learning_rate=pi_lr)
-  vf_optimizer = MpiAdamOptimizer(learning_rate=vf_lr)
-
-  def update():
-    obs_buf, act_buf, adv_buf, ret_buf, logp_buf = buf.get()
-
-    with tf.GradientTape() as pi_tape, tf.GradientTape() as vf_tape:
-      pi, logp, v = actor_critic(obs_buf, act_buf)
-
-      pi_loss = -tf.reduce_mean(logp * adv_buf)
-      v_loss = tf.reduce_mean((ret_buf - v) ** 2)
-
-    if hasattr(actor_critic, 'log_std'):
-      all_trainable_variables = [actor_critic.log_std, *actor_critic.pi_mlp.trainable_variables]
-      pi_grads = pi_tape.gradient(pi_loss, all_trainable_variables)
-      pi_optimizer.apply_gradients(zip(pi_grads, all_trainable_variables))
-    else:
-      pi_grads = pi_tape.gradient(pi_loss, actor_critic.pi_mlp.trainable_variables)
-      pi_optimizer.apply_gradients(zip(pi_grads, actor_critic.pi_mlp.trainable_variables))
-
-    vf_grads = vf_tape.gradient(v_loss, actor_critic.v_mlp.trainable_variables)
-    for _ in range(train_v_iters):
-      vf_optimizer.apply_gradients(zip(vf_grads, actor_critic.v_mlp.trainable_variables))
-
-    # sync params across processes
-    sync_actor_critic(actor_critic)
 
   """
   Main loop: collect experience in env and update/log each epoch
@@ -280,7 +277,7 @@ def vpg(env, ac_kwargs=None, seed=0, steps_per_epoch=4000, epochs=50, gamma=0.99
         o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
 
     # Perform VPG update!
-    update()
+    actor_critic.update(buf)
     mean, std = mpi_statistics_scalar(all_ep_ret)
     all_ep_ret = []
     if proc_id() == 0:
@@ -290,13 +287,14 @@ def vpg(env, ac_kwargs=None, seed=0, steps_per_epoch=4000, epochs=50, gamma=0.99
 
   if proc_id() == 0:
     plt.plot(totalEnvInteracts, summary_ep_ret)
+    plt.grid(True)
     plt.show()
 
 
-if __name__ == '__main__':
+def main():
   import argparse
   parser = argparse.ArgumentParser()
-  parser.add_argument('--env', type=str, default='HalfCheetah-v2')
+  parser.add_argument('--env', type=str, default='CartPole-v0')
   parser.add_argument('--hid', type=int, default=64)
   parser.add_argument('--l', type=int, default=2)
   parser.add_argument('--gamma', type=float, default=0.99)
@@ -305,7 +303,7 @@ if __name__ == '__main__':
   parser.add_argument('--steps', type=int, default=4000)
   parser.add_argument('--epochs', type=int, default=50)
   parser.add_argument('--exp_name', type=str, default='vpg')
-  args = parser.parse_args()
+  args, _ = parser.parse_known_args()
 
   mpi_fork(args.cpu)  # run parallel code with mpi
 
