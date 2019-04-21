@@ -6,7 +6,7 @@ import gym
 from gym.spaces import Box, Discrete
 import time
 from utils.mpi_tools import mpi_fork, proc_id, mpi_statistics_scalar, num_procs
-from utils.mpi_tf import MpiAdamOptimizer, sync_params, sync_model
+from utils.mpi_tf import MpiAdamOptimizer, sync_model
 import scipy.signal
 
 tfd = tfp.distributions
@@ -45,16 +45,27 @@ def gaussian_likelihood(x, mu, log_std):
   return tf.reduce_sum(pre_sum, axis=1)
 
 
-def make_mlp_model(input_shape, sizes, activation='tanh', output_activation=None):
-  """ Build a feedforward neural network. """
-  mlp = tf.keras.Sequential()
-  mlp.add(tf.keras.layers.Dense(sizes[0], activation=activation, input_shape=(input_shape,)))
-  if len(sizes) > 2:
-    for size in sizes[1:-1]:
-      mlp.add(tf.keras.layers.Dense(size, activation=activation))
+class MLP(tf.keras.Model):
+  def __init__(self,
+               sizes,
+               activation='tanh',
+               output_activation=None,
+               is_continue_action=False,
+               act_dim=None):
+    super().__init__()
 
-  mlp.add(tf.keras.layers.Dense(sizes[-1], activation=output_activation))
-  return mlp
+    self.denses = [tf.keras.layers.Dense(size, activation=activation) for size in sizes[:-1]]
+    self.out = tf.keras.layers.Dense(sizes[-1], activation=output_activation)
+    if is_continue_action:
+      if act_dim is None:
+        raise TypeError("__init__() missing 1 argument: 'act_dim' when log_std=True")
+      self.log_std = tf.Variable(name='log_std', initial_value=-0.5 * np.ones(act_dim, dtype=np.float32))
+
+  @tf.function
+  def call(self, x):
+    for dense in self.denses:
+      x = dense(x)
+    return self.out(x)
 
 
 """
@@ -63,26 +74,25 @@ Actor-Critics
 
 
 class ActorCritic:
-  def __init__(self, obs_dim, hidden_sizes=(64, 64), activation='tanh', output_activation=None, action_space=None, pi_lr=3e-4, vf_lr=1e-3, train_v_iters=80):
+  def __init__(self, hidden_sizes=(64, 64), activation='tanh', output_activation=None, action_space=None, pi_lr=3e-4, vf_lr=1e-3, train_v_iters=80):
     if isinstance(action_space, Box):
       act_dim = len(action_space.sample())
-      self.pi_mlp = make_mlp_model(obs_dim, list(hidden_sizes) + [act_dim], activation, output_activation)
+      self.pi_mlp = MLP(list(hidden_sizes) + [act_dim], activation, output_activation, is_continue_action=True)
       self.policy = self._mlp_gaussian_policy
-      self.log_std = tf.Variable(name='log_std', initial_value=-0.5 * np.ones(act_dim, dtype=np.float32))
 
     elif isinstance(action_space, Discrete):
       act_dim = action_space.n
-      self.pi_mlp = make_mlp_model(obs_dim, list(hidden_sizes) + [act_dim], activation, None)
+      self.pi_mlp = MLP(list(hidden_sizes) + [act_dim], activation, None)
       self.policy = self._mlp_categorical_policy
       self.action_space = action_space
-    self.v_mlp = make_mlp_model(obs_dim, list(hidden_sizes) + [1], activation, None)
+    self.v_mlp = MLP(list(hidden_sizes) + [1], activation, None)
     # optimizers
     self.pi_optimizer = MpiAdamOptimizer(learning_rate=pi_lr)
     self.vf_optimizer = MpiAdamOptimizer(learning_rate=vf_lr)
     self.train_v_iters = train_v_iters
 
   @tf.function
-  def __call__(self, observation, action):
+  def __call__(self, observation, action=None):
     pi, logp_pi = self.policy(observation, action)
     v = tf.squeeze(self.v_mlp(observation), axis=1)
     return pi, logp_pi, v
@@ -94,19 +104,19 @@ class ActorCritic:
     pi = tfd.Categorical(logits).sample()  # pi is the next action
     if action is not None:
       action = tf.cast(action, tf.int32)
-      logp = tf.reduce_sum(tf.one_hot(action, act_dim) * logp_all, axis=1)
+      logp = tf.reduce_sum(tf.one_hot(action, act_dim, dtype=tf.float64) * logp_all, axis=1)
     else:
-      logp = tf.reduce_sum(tf.one_hot(pi, act_dim) * logp_all, axis=1)
+      logp = tf.reduce_sum(tf.one_hot(pi, act_dim, dtype=tf.float64) * logp_all, axis=1)
     return pi, logp
 
   def _mlp_gaussian_policy(self, observation, action):
     mu = self.pi_mlp(observation)
-    std = tf.exp(self.log_std)
+    std = tf.exp(self.pi_mlp.log_std)
     pi = mu + tf.random.normal(tf.shape(mu)) * std  # pi is the next action
     if action is not None:
-      logp = gaussian_likelihood(action, mu, self.log_std)
+      logp = gaussian_likelihood(action, mu, self.pi_mlp.log_std)
     else:
-      logp = gaussian_likelihood(pi, mu, self.log_std)
+      logp = gaussian_likelihood(pi, mu, self.pi_mlp.log_std)
     return pi, logp
 
   def update(self, buf):
@@ -118,13 +128,16 @@ class ActorCritic:
       pi_loss = -tf.reduce_mean(logp * adv_buf)
       v_loss = tf.reduce_mean((ret_buf - v) ** 2)
 
-    if hasattr(self, 'log_std'):
-      all_trainable_variables = [self.log_std, *self.pi_mlp.trainable_variables]
-      pi_grads = pi_tape.gradient(pi_loss, all_trainable_variables)
-      self.pi_optimizer.apply_gradients(zip(pi_grads, all_trainable_variables))
-    else:
-      pi_grads = pi_tape.gradient(pi_loss, self.pi_mlp.trainable_variables)
-      self.pi_optimizer.apply_gradients(zip(pi_grads, self.pi_mlp.trainable_variables))
+    # if hasattr(self, 'log_std'):
+    #   all_trainable_variables = [self.log_std, *self.pi_mlp.trainable_variables]
+    #   pi_grads = pi_tape.gradient(pi_loss, all_trainable_variables)
+    #   self.pi_optimizer.apply_gradients(zip(pi_grads, all_trainable_variables))
+    # else:
+      # pi_grads = pi_tape.gradient(pi_loss, self.pi_mlp.trainable_variables)
+      # self.pi_optimizer.apply_gradients(zip(pi_grads, self.pi_mlp.trainable_variables))
+
+    pi_grads = pi_tape.gradient(pi_loss, self.pi_mlp.trainable_variables)
+    self.pi_optimizer.apply_gradients(zip(pi_grads, self.pi_mlp.trainable_variables))
 
     vf_grads = vf_tape.gradient(v_loss, self.v_mlp.trainable_variables)
     for _ in range(self.train_v_iters):
@@ -134,8 +147,6 @@ class ActorCritic:
     self.synchronize()
 
   def synchronize(self):
-    if hasattr(self, 'log_std'):
-      sync_params([self.log_std])
     sync_model(self.pi_mlp)
     sync_model(self.v_mlp)
 
@@ -230,10 +241,9 @@ def vpg(env, ac_kwargs=None, seed=0, steps_per_epoch=4000, epochs=50, gamma=0.99
   np.random.seed(seed)
   # Create actor-critic agent and synchronize it
   ac_kwargs['action_space'] = env.action_space
-  ac_kwargs['obs_dim'] = env.observation_space.shape[0]
 
   actor_critic = ActorCritic(**ac_kwargs)
-  actor_critic.synchronize()
+  # actor_critic.synchronize()
 
   # Experience buffer
   obs_dim = env.observation_space.shape
@@ -253,7 +263,7 @@ def vpg(env, ac_kwargs=None, seed=0, steps_per_epoch=4000, epochs=50, gamma=0.99
   totalEnvInteracts = []
   for epoch in range(epochs):
     for t in range(local_steps_per_epoch):
-      a, logp_t, v_t = actor_critic(o.reshape(1, -1), None)
+      a, logp_t, v_t = actor_critic(o.reshape(1, -1))
 
       # save and log
       a = a.numpy()[0]
@@ -299,9 +309,9 @@ def main():
   parser.add_argument('--l', type=int, default=2)
   parser.add_argument('--gamma', type=float, default=0.99)
   parser.add_argument('--seed', '-s', type=int, default=0)
-  parser.add_argument('--cpu', type=int, default=1)
+  parser.add_argument('--cpu', type=int, default=4)
   parser.add_argument('--steps', type=int, default=4000)
-  parser.add_argument('--epochs', type=int, default=50)
+  parser.add_argument('--epochs', type=int, default=70)
   parser.add_argument('--exp_name', type=str, default='vpg')
   args, _ = parser.parse_known_args()
 

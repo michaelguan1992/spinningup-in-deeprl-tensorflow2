@@ -5,27 +5,25 @@ from utils.mpi_tools import broadcast
 
 
 def flat_concat(xs):
-
   return tf.concat([tf.reshape(x, (-1,)) for x in xs], axis=0)
 
 
-def assign_params_from_flat(flat_params, params):
+def _get_params_from_flat(flat_params, params):
+
   splits = tf.split(flat_params, [tf.size(p) for p in params])
   new_params = [tf.reshape(p_new, p.shape) for p, p_new in zip(params, splits)]
   return new_params
 
 
-def sync_params(params):
+def _get_sync_params(params):
   flat_params = flat_concat(params).numpy()
   broadcast(flat_params, root=0)
-  return assign_params_from_flat(flat_params, params)
+  return _get_params_from_flat(flat_params, params)
 
 
 def sync_model(model):
-
   params = model.get_weights()
-
-  new_params = sync_params(params)
+  new_params = _get_sync_params(params)
   model.set_weights(new_params)
 
 
