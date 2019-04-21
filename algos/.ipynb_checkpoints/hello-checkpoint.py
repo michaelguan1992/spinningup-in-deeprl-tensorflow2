@@ -1,2 +1,0 @@
-def sayhi():
-    print('hi')
