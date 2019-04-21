@@ -59,7 +59,7 @@ class MLP(tf.keras.Model):
     if is_continue_action:
       if act_dim is None:
         raise TypeError("__init__() missing 1 argument: 'act_dim' when log_std=True")
-      self.log_std = tf.Variable(name='log_std', initial_value=-0.5 * np.ones(act_dim, dtype=np.float32))
+      self.log_std = tf.Variable(name='log_std', initial_value=-0.5 * np.ones(act_dim, dtype=np.float64))
 
   @tf.function
   def call(self, x):
@@ -77,7 +77,7 @@ class ActorCritic:
   def __init__(self, hidden_sizes=(64, 64), activation='tanh', output_activation=None, action_space=None, pi_lr=3e-4, vf_lr=1e-3, train_v_iters=80):
     if isinstance(action_space, Box):
       act_dim = len(action_space.sample())
-      self.pi_mlp = MLP(list(hidden_sizes) + [act_dim], activation, output_activation, is_continue_action=True)
+      self.pi_mlp = MLP(list(hidden_sizes) + [act_dim], activation, output_activation, is_continue_action=True, act_dim=act_dim)
       self.policy = self._mlp_gaussian_policy
 
     elif isinstance(action_space, Discrete):
@@ -112,8 +112,9 @@ class ActorCritic:
   def _mlp_gaussian_policy(self, observation, action):
     mu = self.pi_mlp(observation)
     std = tf.exp(self.pi_mlp.log_std)
-    pi = mu + tf.random.normal(tf.shape(mu)) * std  # pi is the next action
+    pi = mu + tf.random.normal(tf.shape(mu), dtype=tf.float64) * std  # pi is the next action
     if action is not None:
+      action = tf.cast(action, tf.float64)
       logp = gaussian_likelihood(action, mu, self.pi_mlp.log_std)
     else:
       logp = gaussian_likelihood(pi, mu, self.pi_mlp.log_std)
@@ -243,7 +244,6 @@ def vpg(env, ac_kwargs=None, seed=0, steps_per_epoch=4000, epochs=50, gamma=0.99
   ac_kwargs['action_space'] = env.action_space
 
   actor_critic = ActorCritic(**ac_kwargs)
-  # actor_critic.synchronize()
 
   # Experience buffer
   obs_dim = env.observation_space.shape
@@ -304,7 +304,7 @@ def vpg(env, ac_kwargs=None, seed=0, steps_per_epoch=4000, epochs=50, gamma=0.99
 def main():
   import argparse
   parser = argparse.ArgumentParser()
-  parser.add_argument('--env', type=str, default='CartPole-v0')
+  parser.add_argument('--env', type=str, default='Pendulum-v0')
   parser.add_argument('--hid', type=int, default=64)
   parser.add_argument('--l', type=int, default=2)
   parser.add_argument('--gamma', type=float, default=0.99)
